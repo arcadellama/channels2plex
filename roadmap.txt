@@ -1,0 +1,6 @@
+- Parallel processing
+_ FFMPEG options
+_ command line options
+_ separate global from local variables
+_ make functions portable as possible
+_ Make ffmpeg conversion optional

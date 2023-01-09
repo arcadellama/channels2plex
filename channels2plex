@@ -1,0 +1,371 @@
+#!/usr/bin/env sh
+
+set -e
+# Global variables
+PRGNAM=$(basename "$0")
+CWD="$(pwd)"
+
+TMP='/tmp'
+BIN_PATH='/usr/local/bin'
+LOCK_FILE="$TMP/$PRGNAM.lock"
+LOG_FILE="$HOME/.local/$PRGNAM.log"
+
+CHANNELS_DVR_PATH="/media/arcadepool/channels-dvr/TV"
+PLEX_TV_PATH="/media/arcadepool/plexmedia/tv"
+PLEX_USER='plex'
+PLEX_GROUP='plex'
+
+FFMPEG_BIN="$BIN_PATH/ffmpeg"
+COMCUT_BIN="$BIN_PATH/comcut"
+CCEXTRACTOR_BIN="$BIN_PATH/ccextractor"
+
+# OPTIONAL: for Plex API interaction
+PLEX_IP="10.0.1.111"
+PLEX_PORT="32400"
+PLEX_TV_SECTION_IDS="" # if known, spearated by a space
+
+
+# TODO: troubleshoot using variables in ffmpeg command
+#ffmpeg_decode_flags="-hwaccel nvdec -c:v mpeg2video"
+#ffmpeg_encode_flags="-c:v h264_nvenc"
+
+## Functions
+clean_up() {
+    log_this "Cleaning up temp files ('$LOCK_FILE' and '$tmp_dir')"
+    rm -rf "$LOCK_FILE" "$tmp_dir"
+}
+
+log_this() {
+    [ -d "$(dirname "$LOG_FILE")" ] || mkdir -p "$(dirname "$LOG_FILE")"
+    [ -f "$LOG_FILE" ] || :>"$LOG_FILE"
+    printf "[%s]\n%s\n" "$(date -u)" "$*" # >> "$LOG_FILE "
+}
+
+trim_quotes() {
+    set -f
+    old_ifs=$IFS
+    IFS=\"\'
+    set -- $1
+    IFS=
+    printf '%s\n' "$*"
+    IFS=$old_ifs
+    set +f
+}
+
+season_number() {
+    set -f
+    old_ifs=$IFS
+    IFS=E
+    #shellcheck disable=SC2086
+    set -- $1
+    printf '%s\n' "$1"
+    IFS=$old_ifs
+    set +f
+}
+
+parse_plex_directory() {
+    case "$1" in
+        \<Directory*) printf "%s\n" "$1" 
+            return ;;
+    esac
+}
+
+parse_plex_type() {
+    set -f
+    old_ifs=$IFS
+    IFS=' '
+    set -- $1
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            type=*)
+                printf "%s\n" "$(trim_quotes "${1##type=}")"
+                break ;;
+            *) shift ;;
+        esac
+    done
+    IFS=$old_ifs
+    set +f
+}
+
+parse_plex_id() {
+    set -f
+    old_ifs=$IFS
+    IFS=' '
+    set -- $1
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            key=*)
+                key="${1##key=\"}"
+                printf "%s\n" "${key%\"}"
+                break ;;
+            *) shift ;;
+        esac
+    done
+    IFS=$old_ifs
+    set +f
+}
+
+parse_plex_tv_sections() {
+    _section_api="$*"
+    _return_id=""
+    while read -r line; do
+        _directory=""
+        _media_type=""
+        _id=""
+        _directory="$(parse_plex_directory "$line")"
+        if [ -z "$_directory" ]; then
+            continue
+        fi
+        _media_type="$(parse_plex_type "$_directory")"
+        _id="$(parse_plex_id "$_directory")"
+        if [ -n "$_media_type" ]; then
+            case "$_media_type" in
+                show)
+                    if [ -z "$_return_id" ]; then
+                        _return_id="$_id"
+                    else
+                        _return_id="${_return_id} ${_id}"
+                    fi
+                    ;;
+            esac
+        fi
+    done << EOF
+$(printf "%s" "$_section_api")
+EOF
+    # Return TV Section id's
+    printf "%s\n" "$_return_id"
+}
+
+get_plex_sections() {
+    if [ ! -x "$(command -v curl)" ]; then
+        log_this "Warning: curl not found."
+        return 1
+    fi
+    __return="$(curl -s http://"$PLEX_IP":"$PLEX_PORT"/library/sections/)"
+    case "$__return" in 
+        *401*) return 1 ;;
+    esac
+    printf "%s\n" "$__return"
+    return
+}
+
+refresh_plex() {
+    __library=$1
+    if [ ! -x "$(command -v curl)" ]; then
+        log_this "Warning: curl not found."
+        return 1
+    fi
+    __return_status="$(curl -s http://"$PLEX_IP":"$PLEX_PORT"/library/sections/"$__library"/refresh)"
+    case "$__return_status" in 
+        *401*) return 1 ;;
+    esac
+    return
+}
+
+
+# Clean-up lock and tmp files on exit
+trap clean_up EXIT
+trap clean_up INT
+
+main() {
+    original_file="$1"
+    file_dir="$(dirname "$original_file")"
+    
+    # Check file_dir
+    # If it is '.' then we are likely operating within the existing directory
+    case "$file_dir" in
+        .) file_dir="$CWD" ;;
+    esac
+    
+    episode_file="$(basename "$original_file")"
+    episode="${episode_file%.*}"
+    episode_edl="$file_dir/$episode.edl"
+    series="$(basename "$file_dir")"
+    season="" # parsed later
+    
+    tmp_dir="$TMP/$PRGNAM/$series/$episode"
+    tmp_episode="$tmp_dir/$episode.ts"
+    tmp_edl="$tmp_dir/$episode.edl"
+    tmp_encode="$tmp_dir/$episode.mkv"
+    tmp_srt="$tmp_dir/$episode.en.srt"
+    
+    
+    # Get season from filename
+    set -f
+    old_ifs=$IFS
+    while IFS=' ' read -r word; do
+        case "$word" in
+            S[0-9][0-9]E*)
+                season="Season $(season_number "${word#S}")"
+                ;;
+        esac
+    done << EOF
+$(printf "%s\n" $episode)
+EOF
+    IFS=$old_ifs
+    set +f
+    
+    # Dependency check
+    for _bin in "$FFMPEG_BIN" "$COMCUT_BIN" "$CCEXTRACTOR_BIN"; do
+        if [ ! -x "$_bin" ]; then
+            log_this "Error: $_bin not found."
+            exit 1
+        fi
+    done
+    
+    # Check if season exists (skipping daily shows for now)
+    if [ -z "$season" ]; then
+        log_this "$episode is likely a news or sports broadcast, skipping."
+        return
+    fi
+    
+    # Check if edl exists
+    if [ ! -r "$episode_edl" ]; then
+        log_this "No edl file for $episode, skipping"
+        return
+    fi
+    
+    # Check if file already exists in Plex directory
+    if [ -r "$PLEX_TV_PATH/$series/$season/$episode.$PRGNAM.mkv" ]; then
+        log_this "$episode already copied to Plex."
+        return
+    fi
+    
+    # Check for lock file
+    while [ -f "$LOCK_FILE" ]; do
+        log_this "'$LOCK_FILE' exists, waiting to process '$series/$episode'."
+        sleep 10
+    done
+    
+    # Create lock file
+    log_this "Creating lock file for processing '$episode'"
+    touch "$LOCK_FILE"
+    
+    # Create tmp directory and copy original files there for processing
+    rm -rf "$tmp_dir"
+    
+    if ! mkdir -p "$tmp_dir"; then
+        log_this "Error: cannot create '$tmp_dir" 
+        exit 1
+    fi
+    
+    if ! cp -a "$original_file" "$tmp_episode"; then
+        log_this "Error: Cannot copy '$original_file' to '$tmp_episode'"
+        exit 1
+    elif ! cp -a "$episode_edl" "$tmp_edl"; then
+        log_this "Error: Cannot copy '$episode_edl' to '$tmp_edl'"
+        exit 1
+    fi
+    
+    # Move to working temp dir
+    if ! cd "$tmp_dir" >/dev/null 2>&1; then
+        log_this "Error: cannot find $tmp_dir"
+        exit 1
+    fi
+    
+    # Cut commercials
+    log_this "Cutting commercials from $tmp_episode"
+    
+    if ! $COMCUT_BIN --ffmpeg="$FFMPEG_BIN" \
+        --lockfile="$TMP/comcut.lock" \
+        "$(basename "$tmp_episode")"; then
+        log_this "Error cutting from $tmp_episode"
+        exit 1
+    fi
+    
+    # Get closed captions from to file
+    log_this "Pulling closed captions from $tmp_episode" 
+    if ! $CCEXTRACTOR_BIN \
+        "$tmp_episode" \
+        -o "$tmp_srt"; then
+        log_this "WARN: cannot extract closed captions from $tmp_episode."
+        exit 1
+    fi
+    
+    # Encode file to H.264 with mkv container using ffmpeg and mux in CC srt
+    log_this "Re-encoding '$tmp_episode' to MKV file while adding cc data"
+    if ! $FFMPEG_BIN \
+        -nostdin \
+        -hide_banner \
+        -loglevel error \
+        -hwaccel nvdec \
+        -i "$tmp_episode" \
+        -i "$tmp_srt" \
+        -map 0 -map 1 \
+        -acodec copy \
+        -scodec copy \
+        -c:v h264_nvenc \
+        "$tmp_encode"; then
+        log_this "Error: cannot convert '$tmp_episode'"
+        exit 1
+    fi
+
+    # Check that the file exported
+    if [ ! -f "$tmp_encode" ]; then
+        log_this "Error: '$tmp_encode' was not encoded by ffmpeg."
+        exit 1
+    fi
+    
+    # Copy Channels DVR file to Plex
+    if ! mkdir -p "$PLEX_TV_PATH/$series/$season"; then
+        log_this "Error: cannot create" \
+        "'$PLEX_TV_PATH/$series/$season' directory"
+        exit 1
+    fi
+
+    plex_output="$PLEX_TV_PATH/$series/$season/$episode.$PRGNAM.mkv"
+    
+    log_this "Copying '$tmp_encode'" \
+        "to '$PLEX_TV_PATH/$series/$season/$episode.$PRGNAM.mkv'"
+    if ! cp -a "$tmp_encode" "$plex_output"; then
+        log_this "Error: cannot coppy '$tmp_encode' to '$plex_output'"
+        exit 1
+    fi
+
+    log_this "Changing ownership of '$PLEX_TV_PATH/$series/$season' to" \
+        "'$PLEX_USER':'$PLEX_GROUP'"
+    if ! chown -R $PLEX_USER:$PLEX_GROUP "$PLEX_TV_PATH/$series/$season"; then
+        log_this "Warn: unable to change ownership of $PLEX_TV_PATH"
+    fi
+    
+    log_this "Success! '$original_file' converted and copied to Plex."
+
+
+    # Refresh Plex TV libraries, if possible
+    if [ -n "$PLEX_TV_SECTION_IDS" ]; then
+        for id in $PLEX_TV_SECTION_IDS; do
+            log_this "Refreshing Plex library '$id'"
+            if ! refresh_plex "$id"; then
+                log_this "Error refreshing Plex, library id '$id'"
+            fi
+        done
+    fi
+    
+    # TODO: inform Sonarr API that a manually imported file?
+    # TODO: have option to remove file from Channels DVR
+    log_this "Cleaning up"
+    clean_up
+    return
+}
+
+# Try to get TV Section IDs from Plex
+plex_sections=""
+if [ -n "$PLEX_IP" ] && [ -z "$PLEX_PLEX_TV_SECTION_IDS" ]; then
+    plex_sections="$(get_plex_sections)"
+    if [ "$plex_sections" ]; then
+        PLEX_TV_SECTION_IDS="$(parse_plex_tv_sections "$plex_sections")"
+    fi
+fi
+
+# Walk through the channels dvr path and look for files
+for dir in $CHANNELS_DVR_PATH/*; do
+    [ -d "$dir" ] || continue
+    for file in $dir/*; do
+        [ -f "$file" ] || continue
+        case "$file" in *.mpg)
+            main "$file" ;;
+        esac
+    done
+done
+
+exit
