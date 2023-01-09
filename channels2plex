@@ -1,28 +1,106 @@
 #!/usr/bin/env sh
 
+# set -x
 set -e
-# Global variables
+
 PRGNAM=$(basename "$0")
 CWD="$(pwd)"
 
-TMP='/tmp'
-BIN_PATH='/usr/local/bin'
-LOCK_FILE="$TMP/$PRGNAM.lock"
-LOG_FILE="$HOME/.local/$PRGNAM.log"
+# Global variables
+TMP="${TMP:-/tmp/$PRGNAM}"
+BIN_PATH="${BIN_PATH:-'/usr/local/bin'}"
+LOCK_FILE="${LOCK_FILE:-$TMP/$PRGNAM.lock}"
+LOG_FILE="${LOG_FILE:-}" # unset defaults to stdout
 
-CHANNELS_DVR_PATH="/media/arcadepool/channels-dvr/TV"
-PLEX_TV_PATH="/media/arcadepool/plexmedia/tv"
-PLEX_USER='plex'
-PLEX_GROUP='plex'
+# Paths for show files
+PLEX_TV_PATH="${PLEX_TV_PATH:-}" # Required
+CHANNELS_DVR_PATH="${CHANNELS_DVR_PATH:-}" # Optional 
 
-FFMPEG_BIN="$BIN_PATH/ffmpeg"
-COMCUT_BIN="$BIN_PATH/comcut"
-CCEXTRACTOR_BIN="$BIN_PATH/ccextractor"
+# Paths for binaries
+FFMPEG_BIN="${FFMPEG_BIN:-$BIN_PATH/ffmpeg}" # if unset, will simply copy
+COMCUT_BIN="${COMCUT_BIN:-$BIN_PATH/comcut}" # Optional
+CCEXTRACTOR_BIN="${CCEXTRACTOR_BIN:-$BIN_PATH/ccextractor}" # Optional
+CURL_BIN="${CURL_BIN:-$(command -v curl >/dev/null 2>&1)}" # Optional
+RSYNC_BIN="${RSYNC_BIN:-$(command -v rsync >/dev/null 2>&1)}" # Optional
+# Will use 'cp -a' if rsync is unset
 
-# OPTIONAL: for Plex API interaction
-PLEX_IP="10.0.1.111"
-PLEX_PORT="32400"
-PLEX_TV_SECTION_IDS="" # if known, spearated by a space
+# ffmpeg options
+FFMPEG_ENCODE_FLAGS="${FFMPEG_ENCODE_FLAGS:-}" # defaults to h264 automatic
+FFMPEG_NVIDIA="${FFMPEG_NVIDIA:-no}" # yes|no # will attempt to use nvenc
+FFMPEG_QUICKSYNC="${FFMPEG_QUICKSYNC:-no}" # yes|no
+
+# OPTIONAL: Plex user and group
+# if blank, will not try to change ownership
+PLEX_USER="${PLEX_USER:-}" 
+PLEX_GROUP="${PLEX_GROUP:-}"
+
+# OPTIONAL: for Channels DVR api interaction, e.g., purging deleted files
+CHANNELS_DVR_IP="${CHANNELS_DVR_IP:-127.0.0.1}"
+CHANNELS_DVR_PORT="${CHANNELS_DVR_PORT:-8089}"
+
+# OPTIONAL: for Plex API interaction, e.g., refreshing libraries
+
+# Plex IP address, set with '--plex-ip <ip address>'
+PLEX_IP="${PLEX_IP:-127.0.0.1}"
+# Plex Port, set with '--plex-port <port>'
+PLEX_PORT="${PLEX_PORT:-32400}"
+
+# Plex API key, can be a path to the key or the key itself
+# set with '--plex-api-key </path/to/key> OR <key>
+PLEX_API_KEY="${PLEX_API_KEY:-}" # will still try if unset
+
+# The API needs to know which libraries to rescan
+# If you already know the ids of your TV show libraries
+# you can put them here, separated by a space
+# If you don't know them, (and why would you?),
+# c2p will attempt to find them via the API
+# (there is not a command line argument for this because that just crazy)
+PLEX_TV_SECTION_IDS="${PLEX_TV_SECTION_IDS:-}" 
+
+# Configuration file search paths; will stop at the first found
+DEFAULT_CONFIG_FILEPATHS="
+$HOME/.$PRGNAM
+$HOME/.$PRGNAM.conf
+$HOME/.config/$PRGNAM.conf
+$HOME/.local/$PRGNAM.conf
+/usr/local/etc/
+/etc/
+"
+## Optional runtime variables
+# Location for configuration file
+# Optionally set with the '--config </path/to/conifg> option
+C2P_CONFIG_FILE="${C2P_CONFIG_FILE:-$DEFAULT_CONFIG_PATHS/$PRGNAM.conf}"
+
+# Save the current configuration?
+# Saves runtime config to first path available above
+# If no path available, will export the configuration to stdout
+# Optionally set with '--save' argument
+# WARNING: This will overwrite any existing config at the location
+# Default is 'no'
+C2P_SAVE_CONFIG="${C2P_SAVE_CONFIG:-no}" 
+
+# Want to see what c2p will do without actually copying or encoding?
+# Set with '--dry-run' argument
+# Defaults to 'no'
+C2P_DRY_RUN="${C2P_DRYRUN:-no}"
+
+# Should channels2plex delete the original files after copying over to Plex?
+# Activated with the '--delete' argument
+# By default, will not delete the original Channels recordings.
+C2P_DELETE_ORIGINAL_FILES="${C2P_DELETE_ORIGINAL_FILES:-no}"
+
+# Should c2p attempt to tell Channels DVR to purge the database via api?
+# Activated with the '--purge' argument
+# Defaults to 'no'
+C2P_PURGE_CHANNELS_DVR="${C2P_PURGE_CHANNELS_DVR:-no}"
+
+# Should c2p only delete files that have already been copied over?
+# Activated with the runtime '--cleanup' argument
+C2P_CLEANUP_ONLY="${C2P_CLEANUP:-no}"
+
+# Should c2p attempt to tell Plex to scan for new library files?
+# Set with '--rescan-library <yes|no>'
+C2P_PLEX_SCAN="${C2P_PLEX_SCAN:-yes}" # yes|no
 
 
 # TODO: troubleshoot using variables in ffmpeg command
@@ -31,14 +109,18 @@ PLEX_TV_SECTION_IDS="" # if known, spearated by a space
 
 ## Functions
 clean_up() {
-    log_this "Cleaning up temp files ('$LOCK_FILE' and '$tmp_dir')"
-    rm -rf "$LOCK_FILE" "$tmp_dir"
+    log_this "Cleaning up temp files ('$LOCK_FILE' and '$TMP')"
+    rm -rf "$LOCK_FILE" "$TMP"
 }
 
 log_this() {
-    [ -d "$(dirname "$LOG_FILE")" ] || mkdir -p "$(dirname "$LOG_FILE")"
-    [ -f "$LOG_FILE" ] || :>"$LOG_FILE"
-    printf "[%s]\n%s\n" "$(date -u)" "$*" # >> "$LOG_FILE "
+    if [ -n "$LOG_FILE" ]; then
+        [ -d "$(dirname "$LOG_FILE")" ] || mkdir -p "$(dirname "$LOG_FILE")"
+        [ -f "$LOG_FILE" ] || touch "$LOG_FILE"
+        printf "[%s]-[%s]\n%s\n" "$(date -u)" "$PRGNAM" "$*" >> "$LOG_FILE"
+    else
+        printf "[%s]-[%s]\n%s\n" "$(date -u)" "$PRGNAM" "$*"
+    fi
 }
 
 trim_quotes() {
@@ -50,6 +132,30 @@ trim_quotes() {
     printf '%s\n' "$*"
     IFS=$old_ifs
     set +f
+}
+
+replace_substr() {
+    # Usage: replace_substr <old> <new> <original string>
+    # Note that this is hardcoded for an IFS of a 'space'
+    # Needs to be modified for any other delimeter
+    _old="$1"
+    _new="$2"
+    _string="$3"
+    set -f
+    old_ifs=$IFS
+    IFS=' '
+    #shellcheck disable=SC2086
+    set -- $string # quotes here intentionaly left off
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            "$_old") printf '%s ' "$_new" # note the built-in space for IFS
+                shift ;;
+            *) printf '%s ' "$1" # note the built-in space for IFS
+                shift ;;
+        esac
+    done
+    IFS=$old_ifs
+    set +F
 }
 
 season_number() {
@@ -180,6 +286,7 @@ main() {
     episode_file="$(basename "$original_file")"
     episode="${episode_file%.*}"
     episode_edl="$file_dir/$episode.edl"
+    episode_json="$file_dir/$episode.json"
     series="$(basename "$file_dir")"
     season="" # parsed later
     
@@ -343,7 +450,6 @@ EOF
     
     # TODO: inform Sonarr API that a manually imported file?
     # TODO: have option to remove file from Channels DVR
-    log_this "Cleaning up"
     clean_up
     return
 }
