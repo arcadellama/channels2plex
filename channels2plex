@@ -1,477 +1,1266 @@
 #!/usr/bin/env sh
 
-# set -x
-set -e
+set -x
 
-PRGNAM=$(basename "$0")
-CWD="$(pwd)"
+prgnam="channels2plex"
+version=0.3
+cwd="$PWD"
 
-# Global variables
-TMP="${TMP:-/tmp/$PRGNAM}"
-BIN_PATH="${BIN_PATH:-'/usr/local/bin'}"
-LOCK_FILE="${LOCK_FILE:-$TMP/$PRGNAM.lock}"
-LOG_FILE="${LOG_FILE:-}" # unset defaults to stdout
+config_file="${config_file:-"${cwd}/${prgnam}.conf"}" # --config <PATH>
+tmp_dir="${tmp_dir:-"/tmp"}" 
 
-# Paths for show files
-PLEX_TV_PATH="${PLEX_TV_PATH:-}" # Required
-CHANNELS_DVR_PATH="${CHANNELS_DVR_PATH:-}" # Optional 
+### Globally Saved Config Variables ###
+verbose="${verbose:-true}" # --verbose <true|false>
+exclude_file="${exclude_file:-${cwd}/exclude.ini}" # --exclude <PATH>
+pid_file="${tmp_dir}/${prgnam}.pid" # --pidfile <PATH>
+working_dir="${working_dir:-"${tmp_dir}/${prgnam}"}" # --working-dir <PATH>
+channels_server_uri="${channels_server_uri:-http://10.0.1.111:8089}" # --channels-uri <address:port>
+plex_server_uri="${plex_server_uri:-}" # --plex-uri <proto://address:port>
+plex_token="${plex_token:-}" # --plex-token <key|path>
 
-# Paths for binaries
-FFMPEG_BIN="${FFMPEG_BIN:-$BIN_PATH/ffmpeg}" # if unset, will simply copy
-COMCUT_BIN="${COMCUT_BIN:-$BIN_PATH/comcut}" # Optional
-CCEXTRACTOR_BIN="${CCEXTRACTOR_BIN:-$BIN_PATH/ccextractor}" # Optional
-CURL_BIN="${CURL_BIN:-$(command -v curl >/dev/null 2>&1)}" # Optional
-RSYNC_BIN="${RSYNC_BIN:-$(command -v rsync >/dev/null 2>&1)}" # Optional
-# Will use 'cp -a' if rsync is unset
+# Program runtime options
+delete_processed="${delete_processed:-true}" # --delete <TRUE|false>
+clean_up="${clean_up:-true}" # --clean-up <TRUE|false>
+transcode_file="${transcode_file:-true}" # --transcode <TRUE|false>
+preserve_subtitles="${preserve_subtitles:-true}" # --subtitles <TRUE|false>
+mark_commercials="${mark_commercials:-}" # --mark-commercials <TRUE|false>
+cut_commercials="${cut_commericals:-true}" # --cut-commercials <TRUE|false>
 
-# ffmpeg options
-FFMPEG_ENCODE_FLAGS="${FFMPEG_ENCODE_FLAGS:-}" # defaults to h264 automatic
-FFMPEG_NVIDIA="${FFMPEG_NVIDIA:-no}" # yes|no # will attempt to use nvenc
-FFMPEG_QUICKSYNC="${FFMPEG_QUICKSYNC:-no}" # yes|no
+### Automagically generated variables ###
+channels_show_dir="${channels_show_dir:-}"
+plex_product="$prgnam"
+plex_client_identifier="${plex_client_identifier:-}"
+plex_show_library_key="${plex_show_library_key:-}"
+plex_show_library_dir="${plex_show_library_dir:-}"
 
-# OPTIONAL: Plex user and group
-# if blank, will not try to change ownership
-PLEX_USER="${PLEX_USER:-}" 
-PLEX_GROUP="${PLEX_GROUP:-}"
+### Required Dependencies ###
+curl_bin="${curl_bin:-$(command -v curl)}" # --curl <PATH>
+jq_bin="${jq_bin:-"$(command -v jq)"}" # --jq <PATH>
 
-# OPTIONAL: for Channels DVR api interaction, e.g., purging deleted files
-CHANNELS_DVR_IP="${CHANNELS_DVR_IP:-127.0.0.1}"
-CHANNELS_DVR_PORT="${CHANNELS_DVR_PORT:-8089}"
-
-# OPTIONAL: for Plex API interaction, e.g., refreshing libraries
-
-# Plex IP address, set with '--plex-ip <ip address>'
-PLEX_IP="${PLEX_IP:-127.0.0.1}"
-# Plex Port, set with '--plex-port <port>'
-PLEX_PORT="${PLEX_PORT:-32400}"
-
-# Plex API key, can be a path to the key or the key itself
-# set with '--plex-api-key </path/to/key> OR <key>
-PLEX_API_KEY="${PLEX_API_KEY:-}" # will still try if unset
-
-# The API needs to know which libraries to rescan
-# If you already know the ids of your TV show libraries
-# you can put them here, separated by a space
-# If you don't know them, (and why would you?),
-# c2p will attempt to find them via the API
-# (there is not a command line argument for this because that just crazy)
-PLEX_TV_SECTION_IDS="${PLEX_TV_SECTION_IDS:-}" 
-
-# Configuration file search paths; will stop at the first found
-DEFAULT_CONFIG_FILEPATHS="
-$HOME/.$PRGNAM
-$HOME/.$PRGNAM.conf
-$HOME/.config/$PRGNAM.conf
-$HOME/.local/$PRGNAM.conf
-/usr/local/etc/
-/etc/
-"
-## Optional runtime variables
-# Location for configuration file
-# Optionally set with the '--config </path/to/conifg> option
-C2P_CONFIG_FILE="${C2P_CONFIG_FILE:-$DEFAULT_CONFIG_PATHS/$PRGNAM.conf}"
-
-# Save the current configuration?
-# Saves runtime config to first path available above
-# If no path available, will export the configuration to stdout
-# Optionally set with '--save' argument
-# WARNING: This will overwrite any existing config at the location
-# Default is 'no'
-C2P_SAVE_CONFIG="${C2P_SAVE_CONFIG:-no}" 
-
-# Want to see what c2p will do without actually copying or encoding?
-# Set with '--dry-run' argument
-# Defaults to 'no'
-C2P_DRY_RUN="${C2P_DRYRUN:-no}"
-
-# Should channels2plex delete the original files after copying over to Plex?
-# Activated with the '--delete' argument
-# By default, will not delete the original Channels recordings.
-C2P_DELETE_ORIGINAL_FILES="${C2P_DELETE_ORIGINAL_FILES:-no}"
-
-# Should c2p attempt to tell Channels DVR to purge the database via api?
-# Activated with the '--purge' argument
-# Defaults to 'no'
-C2P_PURGE_CHANNELS_DVR="${C2P_PURGE_CHANNELS_DVR:-no}"
-
-# Should c2p only delete files that have already been copied over?
-# Activated with the runtime '--cleanup' argument
-C2P_CLEANUP_ONLY="${C2P_CLEANUP:-no}"
-
-# Should c2p attempt to tell Plex to scan for new library files?
-# Set with '--rescan-library <yes|no>'
-C2P_PLEX_SCAN="${C2P_PLEX_SCAN:-yes}" # yes|no
+### Optional Dependencies ###
+ffmpeg_bin="${ffmpeg_bin:-$(command -v ffmpeg)}" # --ffmpeg <PATH>
+comskip_bin="${comskip_bin:-$(command -v comskip)}" # --comskip <PATH>
+comskip_ini="${comskip_ini:-}" # --comskip-ini <PATH>
+comchap="${comchap:-$(command -v comchap)}" # --comchap <PATH>
+comcut="${comcut:-$(command -v comcut)}" # --comcut <PATH>
+ccextractor="${ccextractor:-$(command -v ccextractor)}" # --ccextractor <PATH>
 
 
-# TODO: troubleshoot using variables in ffmpeg command
-#ffmpeg_decode_flags="-hwaccel nvdec -c:v mpeg2video"
-#ffmpeg_encode_flags="-c:v h264_nvenc"
-
-## Functions
+### Start General Use Functions ###
 clean_up() {
-    log_this "Cleaning up temp files ('$LOCK_FILE' and '$TMP')"
-    rm -rf "$LOCK_FILE" "$TMP"
+    rm -f "$pid_file"
+    #rm -rf "$working_dir"
 }
 
-log_this() {
-    if [ -n "$LOG_FILE" ]; then
-        [ -d "$(dirname "$LOG_FILE")" ] || mkdir -p "$(dirname "$LOG_FILE")"
-        [ -f "$LOG_FILE" ] || touch "$LOG_FILE"
-        printf "[%s]-[%s]\n%s\n" "$(date -u)" "$PRGNAM" "$*" >> "$LOG_FILE"
-    else
-        printf "[%s]-[%s]\n%s\n" "$(date -u)" "$PRGNAM" "$*"
-    fi
+generate_config() {
+    cat << EOF
+### Automatically generated from $prgnam ###
+# You can change these variables directly,
+# or pass the configuration at runtime (if noted below)
+
+# channels2plex global variables
+working_dir="$working_dir" # --working-dir </path/to/dir>
+exclude_file="$exclude_file" # --exclude </path/to/file>
+verbose="$verbose" # --verbose <true|false>
+
+# Plex global variables
+plex_token="$plex_token" # --plex-token <token|path/to/token>
+plex_server_uri="$plex_server_uri" # --plex-uri <http(s)://address:port>
+plex_show_library_dir="$plex_show_library_dir" 
+plex_show_library_key="$plex_show_library_key"
+
+# Required Dependencies #
+curl_bin="${curl_bin:-$(command -v curl)}" # --curl <PATH>
+jq_bin="${jq_bin:-"$(command -v jq)"}" # --jq <PATH>
+
+# Optional Dependencies 
+ffmpeg_bin="$ffmpeg_bin" # --ffmpeg <PATH>
+comskip_bin="$comskip_bin" # --comskip <PATH>
+comskip_ini="$comskip_ini" # --comskip-ini <PATH>
+comchap="$comchap" # --comchap <PATH>
+comcut="$comcut" # --comcut <PATH>
+ccextractor="$ccextractor" # --ccextractor <PATH>
+
+# Program runtime options
+delete_processed="$delete_processed" # --delete <TRUE|false>
+clean_up="$clean_up" # --clean-up <TRUE|false>
+transcode_file="$transcode_file" # --transcode <TRUE|false>
+preserve_subtitles="$preserve_subtitles" # --subtitles <TRUE|false>
+mark_commercials="$mark_commercials" # --mark-commercials <TRUE|false>
+cut_commercials="$cut_commericals" # --cut-commercials <TRUE|false>
+
+############# DO NOT CHANGE THIS!  #############
+# This is unique to your instance of the app
+# Changing it will probably invalidate the API,
+# or even worse, more unimaginable things...
+# You've been warned.
+
+plex_product="$plex_product"
+plex_client_identifier="$plex_client_identifier"
+###############################################
+EOF
 }
 
-trim_quotes() {
+# shellcheck disable=SC1001,SC2086
+urlify_string() {
+    _string="$1"
+
+    # Disable globbing to make the word-splitting below safe.
     set -f
-    old_ifs=$IFS
-    IFS=\"\'
-    set -- $1
-    IFS=
-    printf '%s\n' "$*"
-    IFS=$old_ifs
-    set +f
-}
 
-replace_substr() {
-    # Usage: replace_substr <old> <new> <original string>
-    # Note that this is hardcoded for an IFS of a 'space'
-    # Needs to be modified for any other delimeter
-    _old="$1"
-    _new="$2"
-    _string="$3"
-    set -f
+    # Store the current value of 'IFS' so we
+    # can restore it later.
     old_ifs=$IFS
-    IFS=' '
-    #shellcheck disable=SC2086
-    set -- $string # quotes here intentionaly left off
-    while [ "$#" -gt 0 ]; do
-        case "$1" in
-            "$_old") printf '%s ' "$_new" # note the built-in space for IFS
-                shift ;;
-            *) printf '%s ' "$1" # note the built-in space for IFS
-                shift ;;
-        esac
+
+    ###########################################################
+    # %
+    ###########################################################
+    # Settting '%' to be first to convert, so that it doesn't
+    # get confused by the following conversions.
+
+    _urlify=""
+    IFS=\%
+    set -- $_string
+    while [ "$#" -gt 1 ]; do  # >1 to print the last character
+        _urlify="${_urlify}$(printf '%s%%25' "$1")"
+        shift
     done
+    _string="${_urlify}${1}"
+
+    ###########################################################
+    # space
+    ###########################################################
+    _urlify=""
+    IFS=' '
+    set -- $_string
+    while [ "$#" -gt 1 ]; do  # >1 to print the last character
+        _urlify="${_urlify}$(printf '%s%%20' "$1")"
+        shift
+    done
+    _string="${_urlify}${1}"
+
+    ###########################################################
+    # "#"
+    ###########################################################
+    _urlify=""
+    IFS=\#
+    set -- $_string
+    while [ "$#" -gt 1 ]; do  # >1 to print the last character
+        _urlify="${_urlify}$(printf '%s%%23' "$1")"
+        shift
+    done
+    _string="${_urlify}${1}"
+
+    ###########################################################
+    # $
+    ###########################################################
+    _urlify=""
+    IFS=\$
+    set -- $_string
+    while [ "$#" -gt 1 ]; do  # >1 to print the last character
+        _urlify="${_urlify}$(printf '%s%%24' "$1")"
+        shift
+    done
+    _string="${_urlify}${1}"
+
+    ###########################################################
+    # &
+    ###########################################################
+    _urlify=""
+    IFS=\&
+    set -- $_string
+    while [ "$#" -gt 1 ]; do  # >1 to print the last character
+        _urlify="${_urlify}$(printf '%s%%26' "$1")"
+        shift
+    done
+    _string="${_urlify}${1}"
+
+    ###########################################################
+    # @
+    ###########################################################
+    _urlify=""
+    IFS=\@
+    set -- $_string
+    while [ "$#" -gt 1 ]; do  # >1 to print the last character
+        _urlify="${_urlify}$(printf '%s%%40' "$1")"
+        shift
+    done
+    _string="${_urlify}${1}"
+
+    ###########################################################
+    # `
+    ###########################################################
+    _urlify=""
+    IFS=\`
+    set -- $_string
+    while [ "$#" -gt 1 ]; do  # >1 to print the last character
+        _urlify="${_urlify}$(printf '%s%%60' "$1")"
+        shift
+    done
+    _string="${_urlify}${1}"
+
+    ###########################################################
+    # /
+    ###########################################################
+    _urlify=""
+    IFS=\/
+    set -- $_string
+    while [ "$#" -gt 1 ]; do  # >1 to print the last character
+        _urlify="${_urlify}$(printf '%s%%2F' "$1")"
+        shift
+    done
+    _string="${_urlify}${1}"
+
+    ###########################################################
+    # :
+    ###########################################################
+    _urlify=""
+    IFS=\:
+    set -- $_string
+    while [ "$#" -gt 1 ]; do  # >1 to print the last character
+        _urlify="${_urlify}$(printf '%s%%3A' "$1")"
+        shift
+    done
+    _string="${_urlify}${1}"
+
+    ###########################################################
+    # ;
+    ###########################################################
+    _urlify=""
+    IFS=\;
+    set -- $_string
+    while [ "$#" -gt 1 ]; do  # >1 to print the last character
+        _urlify="${_urlify}$(printf '%s%%3B' "$1")"
+        shift
+    done
+    _string="${_urlify}${1}"
+
+    ###########################################################
+    # <
+    ###########################################################
+    _urlify=""
+    IFS=\<
+    set -- $_string
+    while [ "$#" -gt 1 ]; do  # >1 to print the last character
+        _urlify="${_urlify}$(printf '%s%%3C' "$1")"
+        shift
+    done
+    _string="${_urlify}${1}"
+
+    ###########################################################
+    # =
+    ###########################################################
+    _urlify=""
+    IFS=\=
+    set -- $_string
+    while [ "$#" -gt 1 ]; do  # >1 to print the last character
+        _urlify="${_urlify}$(printf '%s%%3D' "$1")"
+        shift
+    done
+    _string="${_urlify}${1}"
+
+    ###########################################################
+    # >
+    ###########################################################
+    _urlify=""
+    IFS=\>
+    set -- $_string
+    while [ "$#" -gt 1 ]; do  # >1 to print the last character
+        _urlify="${_urlify}$(printf '%s%%3E' "$1")"
+        shift
+    done
+    _string="${_urlify}${1}"
+
+    ###########################################################
+    # ?
+    ###########################################################
+    _urlify=""
+    IFS=\?
+    set -- $_string
+    while [ "$#" -gt 1 ]; do  # >1 to print the last character
+        _urlify="${_urlify}$(printf '%s%%3F' "$1")"
+        shift
+    done
+    _string="${_urlify}${1}"
+
+    ###########################################################
+    # [
+    ###########################################################
+    _urlify=""
+    IFS=\[
+    set -- $_string
+    while [ "$#" -gt 1 ]; do  # >1 to print the last character
+        _urlify="${_urlify}$(printf '%s%%5B' "$1")"
+        shift
+    done
+    _string="${_urlify}${1}"
+
+    ###########################################################
+    # \
+    ###########################################################
+    _urlify=""
+    IFS=\\
+    set -- $_string
+    while [ "$#" -gt 1 ]; do  # >1 to print the last character
+        _urlify="${_urlify}$(printf '%s%%5C' "$1")"
+        shift
+    done
+    _string="${_urlify}${1}"
+
+    ###########################################################
+    # ]
+    ###########################################################
+    _urlify=""
+    IFS=\]
+    set -- $_string
+    while [ "$#" -gt 1 ]; do  # >1 to print the last character
+        _urlify="${_urlify}$(printf '%s%%5D' "$1")"
+        shift
+    done
+    _string="${_urlify}${1}"
+
+    ###########################################################
+    # ^
+    ###########################################################
+    _urlify=""
+    IFS=\^
+    set -- $_string
+    while [ "$#" -gt 1 ]; do  # >1 to print the last character
+        _urlify="${_urlify}$(printf '%s%%5E' "$1")"
+        shift
+    done
+    _string="${_urlify}${1}"
+
+    ###########################################################
+    # {
+    ###########################################################
+    _urlify=""
+    IFS=\{
+    set -- $_string
+    while [ "$#" -gt 1 ]; do  # >1 to print the last character
+        _urlify="${_urlify}$(printf '%s%%7B' "$1")"
+        shift
+    done
+    _string="${_urlify}${1}"
+
+    ###########################################################
+    # |
+    ###########################################################
+    _urlify=""
+    IFS=\|
+    set -- $_string
+    while [ "$#" -gt 1 ]; do  # >1 to print the last character
+        _urlify="${_urlify}$(printf '%s%%7C' "$1")"
+        shift
+    done
+    _string="${_urlify}${1}"
+
+    ###########################################################
+    # }
+    ###########################################################
+    _urlify=""
+    IFS=\}
+    set -- $_string
+    while [ "$#" -gt 1 ]; do  # >1 to print the last character
+        _urlify="${_urlify}$(printf '%s%%7D' "$1")"
+        shift
+    done
+    _string="${_urlify}${1}"
+
+    ###########################################################
+    # ~
+    ###########################################################
+    _urlify=""
+    IFS=\~
+    set -- $_string
+    while [ "$#" -gt 1 ]; do  # >1 to print the last character
+        _urlify="${_urlify}$(printf '%s%%7E' "$1")"
+        shift
+    done
+    _string="${_urlify}${1}"
+
+    ###########################################################
+    # "
+    ###########################################################
+    _urlify=""
+    IFS=\"
+    set -- $_string
+    while [ "$#" -gt 1 ]; do  # >1 to print the last character
+        _urlify="${_urlify}$(printf '%s%%22' "$1")"
+        shift
+    done
+    _string="${_urlify}${1}"
+
+    ###########################################################
+    # '
+    ###########################################################
+    _urlify=""
+    IFS=\'
+    set -- $_string
+    while [ "$#" -gt 1 ]; do  # >1 to print the last character
+        _urlify="${_urlify}$(printf '%s%%27' "$1")"
+        shift
+    done
+    _string="${_urlify}${1}"
+
+    ###########################################################
+    # +
+    ###########################################################
+    _urlify=""
+    IFS=\+
+    set -- $_string
+    while [ "$#" -gt 1 ]; do  # >1 to print the last character
+        _urlify="${_urlify}$(printf '%s%%2B' "$1")"
+        shift
+    done
+    _string="${_urlify}${1}"
+
+    ###########################################################
+    # ,
+    ###########################################################
+    _urlify=""
+    IFS=\,
+    set -- $_string
+    while [ "$#" -gt 1 ]; do  # >1 to print the last character
+        _urlify="${_urlify}$(printf '%s%%2C' "$1")"
+        shift
+    done
+    _string="${_urlify}${1}"
+
+    # Restore the original value of IFS
     IFS=$old_ifs
-    set +F
+
+    # Re-enable globbing. 
+    set +f 
+
+    # Return the modified string.
+    printf '%s\n' "$_string"
 }
 
-season_number() {
+keyval_xml() {
+    _key="$1"
+    _xml="$2"
+    _val="${_xml##*"$_key"=\"}" # strip the leading key
+    printf '%s\n' "${_val%%\"\ ?*}" # strip the rest
+}
+
+generate_uid() {
+    _uid=""
+    cd "$working_dir" || return 1
+    _uid="$(mktemp XXXXXXXXXXXXXXXX)" || return 1
+    printf '%s\n' "$_uid"
+    rm -f "$_uid" || return 1
+}
+
+# shellcheck disable=SC2086
+get_file_extension() {
     set -f
     old_ifs=$IFS
-    IFS=E
-    #shellcheck disable=SC2086
+    IFS=\.
     set -- $1
-    printf '%s\n' "$1"
+    shift "$(($#-1))"
+    echo "$1"
     IFS=$old_ifs
     set +f
 }
 
-parse_plex_directory() {
-    case "$1" in
-        \<Directory*) printf "%s\n" "$1" 
-            return ;;
+parse_ini() {
+    _file="$1"
+    _section="$2"
+    _line=""
+    _parse=0
+
+    while read -r _line; do
+        case "$_line" in
+            \#*|\;*) continue ;; # skip comments
+            \["$_section"\]*) _parse=1 ;;
+            \[*\]*) _parse=0 ;; 
+            [[:alnum:]]*) [ "$_parse" -eq 1 ] && printf '%s\n' "$_line" ;;
+        esac
+    done < "$_file"
+}
+
+#### End General Functions ####
+
+#### Start Plex API Functions ####
+get_plex_json() {
+    _type="$1"
+    _key="$2"
+    _output="$working_dir/plex_json_$_type"
+    _url=""
+    _endpoint=""
+
+    # Find the right endpoint
+    case "$_type" in
+        check_token) _url="http://plex.tv" \
+            _endpoint="api/v2/user" ;;
+        resources) _url="https://plex.tv/" \
+            _endpoint="api/resources" ;;
+        status) _url="$plex_server_uri" \
+            _endpoint="status" ;;
+        libraries) _url="$plex_server_uri" \
+            _endpoint="library/sections" ;;
+        metadata) _url="$plex_server_uri" \
+            _endpoint="library/metadata/$_key" ;;
+        refresh) _url="$plex_server_uri" \
+            _endpoint="library/sections/$_key/refresh" ;;
+        *) printf 'Unknown Plex API type: %s\n' \
+            "$_type" >&2; return 1 ;;
     esac
+
+    _ret="$("$curl_bin" \
+        -s \
+        -o "$_output" \
+        -w '%{http_code}' \
+        -X GET \
+        "$_url/$_endpoint" \
+        -H 'accept: application/json' \
+        -d X-Plex-Product="$plex_product" \
+        -d X-Plex-Version="$version" \
+        -d X-Plex-Client-Identifier="$plex_client_identifier" \
+        -d X-Plex-Token="$plex_token")" || return 1
+
+    if [ "$_ret" -ne 200 ]; then # check if successful
+        printf '%s\n' "$_ret" # return the error code to be processed later
+        return 1
+    fi
+
+    # Return the json path
+    printf '%s\n' "$_output" 
 }
 
-parse_plex_type() {
-    set -f
-    old_ifs=$IFS
-    IFS=' '
-    set -- $1
+get_plex_pin() {
+    _url='https://plex.tv/api/v2/pins'
+    _output="$working_dir/plex_pin"
+    _ret="$("$curl_bin" \
+        -s \
+        -o "$_output" \
+        -w '%{http_code}' \
+        -X POST \
+        "$_url" \
+        -H 'accept: application/json' \
+        -d 'strong=true' \
+        -d X-Plex-Product="$plex_product" \
+        -d X-Plex-Version="$version" \
+        -d X-Plex-Client-Identifier="$plex_client_identifier")" || exit 1
+
+    if [ "$_ret" -ge 400 ]; then # check if failed, success POST returns 201
+        printf '%s\n' "$_ret" # return the error code to be processed later
+        return 1
+    fi
+
+    # Return the json path
+    cat "$_output" 
+}
+
+generate_auth_url() {
+    _code="$1"
+    _url="https://app.plex.tv/auth"
+    printf '%s#?clientID=%s&code=%s&context%%5Bdevice%%5D%%5Bproduct%%5D=%s\n' \
+        "$_url" \
+        "$plex_client_identifier" \
+        "$_code" \
+        "$(urlify_string "$prgnam")"
+}
+
+check_auth_pin() {
+    _pin="$1"
+    _code="$2"
+    _url='https://plex.tv/api/v2/pins'
+    _output="$working_dir/check_pin_$_pin" 
+    _ret="$("$curl_bin" \
+        -s \
+        -o "$_output" \
+        -w '%{http_code}' \
+        -X GET \
+        "$_url/$_pin" \
+        -H 'accept: application/json' \
+        -d "code=$_code" \
+        -d X-Plex-Client-Identifier="$plex_client_identifier")" || return 1
+
+    if [ "$_ret" -ne 200 ]; then # check if successful
+        printf '%s\n' "$_ret" # return the error code to be processed later
+        return 1
+    fi
+
+    # Return the json path
+    cat "$_output" 
+}
+
+search_plex_show() {
+    _title="$(urlify_string "$1")"
+    _url="$plex_server_uri/library/sections/$plex_show_library_key"
+    _data="search?type=2&title=$_title"
+    _output="$working_dir/search_result"
+    _ret="$("$curl_bin" \
+        -s \
+        -o "$_output" \
+        -w '%{http_code}' \
+        -X GET \
+        "$_url/$_data" \
+        -H 'accept: application/json' \
+        -d X-Plex-Product="$plex_product" \
+        -d X-Plex-Version="$version" \
+        -d X-Plex-Client-Identifier="$plex_client_identifier" \
+        -d X-Plex-Token="$plex_token")" || return 1
+
+    if [ "$_ret" -ne 200 ]; then # check if successful
+        printf '%s\n' "$_ret" # return the error code to be processed later
+        return 1
+    fi
+
+    # Return the json path
+    printf '%s\n' "$_output" 
+}
+
+# shellcheck disable=SC1001
+parse_plex_server() {
+    # Returns path to temporary configuration file
+    ## Currently only does the first match
+    ## TODO: Prompt the maniacs who have more than one owned server
+    _resources="$1"
+    _output_dir="${working_dir}/parse_plex_server"
+    _output_file=""
+    _device_count=0
+    mkdir -p "$_output_dir"
+    while read -r _line; do
+        case "$_line" in
+            *\<Device\ name=*)
+                case "$_line" in
+                    *owned=\"0\"*) continue ;; # skip if ! owned by user
+                    *provides=\"server\"*)  # proceed if a server
+                        # let's gooooooooooooooo!
+                        _device_count="$((_device_count+1))"
+                        _server_name="$(keyval_xml \
+                            "name" "$_line")"
+                        _server_identifier="$(keyval_xml \
+                            "clientIdentifier" "$_line")"
+                        ;;
+                esac
+                ;;
+            *\<Connection*)
+                case "$_line" in
+                    *local=\"1\"*)
+                        _server_uri="$(keyval_xml "uri" "$_line")" ;;
+                esac
+                ;;
+            *\<\/Device\>*)
+                if [ "$_device_count" -gt 0 ]; then
+                    _output_file="${_output_dir}/${_server_identifier}"
+                    { printf 'plex_server_name="%s"\n' \
+                           "$_server_name" 
+                      printf 'plex_server_identifier="%s"\n' \
+                          "$_server_identifier"
+                      printf 'plex_server_uri="%s"\n' \
+                          "$_server_uri" 
+                    } >> "$_output_file"
+                printf '%s\n' "$_output_file"
+                return
+                fi
+                ;;
+        esac
+    done < "$_resources"
+}
+#### End Plex API Functions ####
+
+#### Start ChannelsDVR API Functions ####
+get_channels_json() {
+    _type="$1"
+    _key="$2"
+    _url="$channels_server_uri"
+    _output="${working_dir}/channels_result_$_type"
+    _endpoint=""
+
+    # Find the right endpoint
+    case "$_type" in
+        status) _endpoint="dvr" ;;
+        files) _endpoint="dvr/files" ;;
+        id) _endpoint="dvr/files/$_key" ;;
+        *)
+            printf "Unknown endpoint: '%s'\n" "$_endpoint"
+            return 1;;
+    esac
+
+    # Make the curl call
+    _ret="$("$curl_bin" \
+        -s \
+        -o "$_output" \
+        -w '%{http_code}' \
+        -X GET \
+        "${_url}/${_endpoint}" \
+        -H 'accept: application/json')" || return 1
+    
+    if [ "$_ret" -ne 200 ]; then # check if successful
+        printf '%s\n' "$_ret" # return the error code to be processed later
+        return 1
+    fi
+
+    # Return the json path
+    printf '%s\n' "$_output" 
+}
+
+delete_channels_file() {
+    _id="$1"
+    _url="$channels_server_uri"
+    _output="${working_dir}/_delete_id_$_id"
+    _endpoint="dvr/files/$_id"
+
+    # Make the curl call
+    _ret="$("$curl_bin" \
+        -s \
+        -o "$_output" \
+        -w '%{http_code}' \
+        -X DELETE \
+        "${_url}/${_endpoint}" \
+        -H 'accept: application:json')" || return 1
+    
+    if [ "$_ret" -ne 200 ]; then # check if successful
+        printf '%s\n' "$_ret" # return the error code to be processed later
+        return 1
+    fi
+
+    # Return the json path
+    printf '%s\n' "$_output" 
+}
+
+get_quality() {
+    while read -r _q; do
+        case "$_q" in
+            ?D\ *) # TODO: test this with SD versions
+                printf '%s\n' "$_q"
+                return
+                ;; 
+            *) printf 'Unknown\n' ;;
+        esac
+    done << EOF
+$(printf '%s\n' "$1")
+EOF
+}
+
+
+#### MAIN FUNCTION ####
+# shellcheck disable=SC1090
+main() {
+    # Check for an already running version
+    if [ -f "$pid_file" ]; then
+        case "$(ps "$(cat "$pid_file")")" in
+            *"$prgnam"*) # check if pid is owned by program
+                printf '%s appears to already be running as %s\n' \
+                    "$prgnam" "$(cat "$pid_file")" >&2
+                return 1 ;;
+            *) rm -f "$pid_file" ;; # remove stale pidfile
+        esac
+    fi
+
+    # Remove previous and create the working directory and create lockfile 
+    rm -rf "$working_dir" || return 1
+    mkdir -p "$working_dir" || return 1
+    printf '%s\n' "$$" > "$pid_file" || return 1
+
+    # Get configuration file
+    if [ -r "$config_file" ]; then
+        . "$config_file" || return 1
+    fi
+
+    # TODO: Command-line arguments here
     while [ "$#" -gt 0 ]; do
         case "$1" in
-            type=*)
-                printf "%s\n" "$(trim_quotes "${1##type=}")"
-                break ;;
-            *) shift ;;
+            --config) config_file="$2"
+                      shift 2;;
         esac
     done
-    IFS=$old_ifs
-    set +f
-}
 
-parse_plex_id() {
-    set -f
-    old_ifs=$IFS
-    IFS=' '
-    set -- $1
-    while [ "$#" -gt 0 ]; do
-        case "$1" in
-            key=*)
-                key="${1##key=\"}"
-                printf "%s\n" "${key%\"}"
-                break ;;
-            *) shift ;;
-        esac
-    done
-    IFS=$old_ifs
-    set +f
-}
+    ### Check for required dependencies ###
+    [ -x "$curl_bin" ] || \
+        { printf 'Error: curl is a required dependency.\n' >&2 ; \
+        return 1 ; }
 
-parse_plex_tv_sections() {
-    _section_api="$*"
-    _return_id=""
-    while read -r line; do
-        _directory=""
-        _media_type=""
-        _id=""
-        _directory="$(parse_plex_directory "$line")"
-        if [ -z "$_directory" ]; then
+    [ -x "$jq_bin" ] || \
+        { printf 'Error: jq is a required dependency.\n' >&2 ; \
+        return 1 ; }
+
+    ### Check for optional dependencies ###
+#     [ -x "$ccextractor" ] || preserve_subtitles=false
+#     [ -x "$comcut" ] || cut_commercials=false
+#     [ -x "$comchap" ] || mark_commercials=false
+#     [ -x "$comskip_bin" ] || cut_commercials=false mark_commercials=false
+#     [ -x "$ffmpeg_bin" ] || transcode_file=false preserve_subtitles=false \
+#         cut_commercials=false mark_commercials=false
+# 
+#     ### Check for competing flags ###
+#     "$cut_commercials" && mark_commercials=false 
+#     "$transcode_file" || preserve_subtitles=false \
+#         cut_commercials=false mark_commercials=false
+
+    ### Get exclusions, if exists ###
+    if [ -r "$exclude_file" ]; then
+        _exclude_genres="$(parse_ini "$exclude_file" "GENRES")"
+        _exclude_shows="$(parse_ini "$exclude_file" "SHOW TITLES")"
+    fi
+
+    #### Start ChannelsDVR pre-requisites ####
+    # Check for server uri
+    if [ -z "$channels_server_uri" ]; then
+        printf 'Error, Channels DVR URI not defined\n'
+        printf 'e.g., <http://localhost:8089>\n'
+        return 1
+    fi
+
+     # Get the Channels DVR show directory
+     _channels_status="$(get_channels_json "status")" || \
+         { printf 'Error getting ChannelsDVR status, error code: %s\n' \
+             "$_channels_status"; return 1; }
+     channels_show_dir="$("$jq_bin" -r \
+         '.path' < "$_channels_status")"
+
+     # Get list of recordings from Channels API (this can take a while)
+     _channels_files="$(get_channels_json "files")" || \
+         { printf 'Error getting ChannelsDVR files, error code: %s\n' \
+             "$_channels_files"; return 1; }
+
+    #### End ChannelsDVR pre-requisite ####
+
+    #### Start Plex Pre-requisite check ####
+    # Check for plex_client_id, generate one if not
+    if [ -z "$plex_client_identifier" ]; then
+        plex_client_identifier="$(generate_uid)" || return 1
+    fi
+
+    # Check that api token exists
+    if [ -n "$plex_token" ]; then 
+        # check if token is a file, read file into variable if so
+        [ -r "$plex_token" ] && plex_token="$(cat "$plex_token")"
+    fi
+
+    # Test the api with local IP, if exists
+    if [ -n "$plex_server_uri" ]; then
+        _valid_api="$(get_plex_json "status")"
+    fi
+
+    # Use the api to test the token if can't access locally
+    if [ ! "$_valid_api" ] && ! _valid_api="$(get_plex_json "check_token")"; then
+        if [ "$_valid_api" -ne 401 ]; then
+            printf "https://plex.tv is unreachable. Error code: %s\n" \
+                "$_valid_api" >&2
+        fi
+
+        printf "Plex API token is expired\n" >&2 
+
+        # Clear the Plex Token for checking
+        plex_token=""
+
+        # TODO: move this to a special setup function or script
+        _plex_pin="$(get_plex_pin)" || \
+            { printf 'Error generating pin, code=%s\n' "$_plex_pin";
+                return 1; }
+
+        # Process the json and create a clickable URL
+        _pin_id="$(printf '%s\n' "$_plex_pin" | "$jq_bin" -r .id)"
+        _pin_code="$(printf '%s\n' "$_plex_pin" | "$jq_bin" -r .code)"
+        _pin_wait="$(printf '%s\n' "$_plex_pin" | "$jq_bin" -r .expiresIn)"
+        _pin_url="$(generate_auth_url "$_pin_code")" || return 1
+
+        printf 'Use the url to login and create a token:\n%s\n' \
+            "$_pin_url"
+
+        while [ "$_pin_wait" -gt 0 ]; do
+            _check_pin="$(check_auth_pin "$_pin_id" "$_pin_code")" || \
+                { printf 'Error checking pin, code: %s\n' "$_check_pin";
+                    return 1; }
+
+            plex_token="$(printf '%s\n' "$_check_pin" | \
+                "$jq_bin" -r .authToken)"
+
+            case "$plex_token" in
+                null) _pin_wait="$((_pin_wait-1))" ;;
+                   *) break ;;
+            esac
+        done
+        if [ -z "$plex_token" ]; then
+            printf 'Error generating Plex token: timed out.' >&2
+            return 1
+        fi
+
+    fi
+
+     if [ -z "$plex_show_library_dir" ] || \
+         [ -z "$plex_show_library_key" ]; then
+        # Get resources for this account
+        _plex_resources="$(get_plex_json "resources")" || \
+            { printf 'Error getting resources, code: %s\n' \
+                "$_plex_resources"; return 1; }
+     fi
+
+     if [ -z "$plex_show_library_dir" ]; then
+         # Get the correct server
+         _plex_server="$(parse_plex_server "$_plex_resources")"
+
+         # Source the plex_server configuration
+         if [ -r "$_plex_server" ]; then
+             . "$_plex_server" || return 1
+         fi
+     fi
+
+     if [ -z "$plex_show_library_key" ] || \
+         [ -z "$plex_show_library_dir" ]; then
+         # Get the correct TV/show library key
+         _plex_libraries="$(get_plex_json "libraries")" || \
+             { printf 'Error getting libraries, code: %s\n' \
+                 "$_plex_libraries"; return 1; }
+
+         _plex_library_types="$("$jq_bin" -r \
+             '.MediaContainer.Directory[].type' < "$_plex_libraries")"
+
+         _plex_type_index=0
+         for _type in $_plex_library_types; do
+             case "$_type" in show) break ;; esac
+             _plex_type_index="$((_plex_type_index+1))"
+         done
+
+         # Return the show library key
+         plex_show_library_key="$("$jq_bin" -r \
+             ".MediaContainer.Directory[$_plex_type_index].key" \
+             < "$_plex_libraries")"
+
+     # Return the TV/show library directory path
+     plex_show_library_dir="$("$jq_bin" -r \
+         .MediaContainer.Directory["$_plex_type_index"].Location[].path \
+         < "$_plex_libraries")"
+     fi
+
+     # Check if directory is accessible
+     if [ ! -d "$plex_show_library_dir" ]; then
+         printf 'Error: cannot find the Plex TV library directory at %s\n' \
+             "$plex_show_library_dir" >&2
+         return 1
+     fi
+
+     # Test if directory is writable
+     _touch_test="$plex_show_library_dir/test"
+     if ! touch "$_touch_test"; then
+         printf 'Error: cannot write the Plex TV library directory at %s\n' \
+             "$plex_show_library_dir" >&2
+         return 1
+     fi
+     rm -f "$_touch_test" || return 1
+
+     #### End Plex prerequisite check ####
+
+     # Save Globals to Configuration
+     # Make a backup of old configuration & overwrite new one
+     [ -w "$config_file" ] && cp "$config_file" "${config_file}.old"
+     _new_config="$(generate_config)"
+     printf '%s\n' "$_new_config" > "$config_file"
+     
+     #### Begin main loop (finally!) ####
+
+     # Get the ids of each file
+     _file_ids="$("$jq_bin" -r '.[].ID' < "$_channels_files")"
+     #DEBUG _file_ids=1078
+
+    # Loop thru the files and find files for processing
+    _processed_count=0
+    _unfinished_count=0
+    _already_deleted_count=0
+    _deleted_count=0
+    _existing_count=0
+    _copied_count=0
+    _transcoded_count=0
+    _excluded_count=0
+    _deleted_list=""
+    _copied_list=""
+    _transcoded_list=""
+    _excluded_list=""
+
+    for _id in $_file_ids; do
+        _processed_count="$((_processed_count+1))"
+        _show_exists=false
+        _skip=false
+        _channels_metadata="$(get_channels_json "id" "$_id")" || \
+            { printf 'Error getting file metadata, error code: %s\n' \
+                "$_channels_metadata"; return 1; }
+
+        # Check if recording is completed and processed, skip
+        # These will return boolean true or false
+        _completed="$("$jq_bin" -r .Completed < "$_channels_metadata")"
+        _processed="$("$jq_bin" -r .Processed < "$_channels_metadata")"
+
+        if ! "$_completed" || ! "$_processed"; then
+            _unfinished_count="$((_unfinished_count+1))"
             continue
         fi
-        _media_type="$(parse_plex_type "$_directory")"
-        _id="$(parse_plex_id "$_directory")"
-        if [ -n "$_media_type" ]; then
-            case "$_media_type" in
-                show)
-                    if [ -z "$_return_id" ]; then
-                        _return_id="$_id"
-                    else
-                        _return_id="${_return_id} ${_id}"
-                    fi
-                    ;;
-            esac
+
+        # Check if marked for deletion and skip
+        _deleted="$("$jq_bin" -r '.DeletedAt' < "$_channels_metadata")"
+        case "$_deleted" in
+            null) true ;;
+            *) _already_deleted_count="$((_already_deleted_count+1))"
+               continue ;;
+        esac
+
+        # Now that we know the recording is good let's get it's metadata!
+        _raw=".Airing.Raw"
+        _program="${_raw}.program"
+        #_qualifiers="$("$jq_bin" -r \
+        #    "${_raw}.qualifiers[]" < "$_channels_metadata")"
+        # ^these are needed due to an unremembered quirk in the channels json
+
+        _series_title="$("$jq_bin" -r \
+            "${_program}.title" < "$_channels_metadata")"
+
+        _episode_title="$("$jq_bin" -r \
+            "${_program}.episodeTitle" < "$_channels_metadata")"
+
+        _season_number="$("$jq_bin" -r \
+            "${_program}.seasonNum" < "$_channels_metadata")"
+
+        _episode_number="$("$jq_bin" -r \
+            "${_program}.episodeNum" < "$_channels_metadata")"
+
+        _genres="$("$jq_bin" -r \
+            "${_program}.genres[]" < "$_channels_metadata")"
+
+        #_quality="$(get_quality "$_qualifiers")"
+
+        _channels_episode_file="${channels_show_dir}/$("$jq_bin" -r \
+            '.Path' < "$_channels_metadata")"
+
+        _channels_edl_file="${_channels_episode_file%.*}.edl"
+
+        # Naming Scheme
+        _new_show_path="${plex_show_library_dir}/${_series_title}/Season ${_season_number}"
+        _new_episode_name="${_series_title} - S${_season_number}E${_episode_number} - ${_episode_title}"
+
+        # Check for exclusions
+        if [ -f "$exclude_file" ]; then
+            for _g in $_exclude_genres; do
+                case "$_genres" in
+                    *"$_g"*) _skip=true ;;
+                esac
+            done
+
+            for _s in $_exclude_shows; do
+                case "$_series_title" in
+                    *"$_s"*) _skip=true ;;
+                esac
+            done
         fi
-    done << EOF
-$(printf "%s" "$_section_api")
+        if "$_skip"; then
+            _excluded_count="$((_excluded_count+1))"
+            _excluded_list="$(printf '%s\n' "$_series_title")"
+            continue # move on to the next ID in the for loop
+        fi
+
+        # let's see if these already exist in Plex with our naming scheme
+        if [ -f "$_new_show_path/$_new_episode_name.*" ]; then
+            _show_exists=true
+            _existing_count="$((_existing_count+1))"
+            if "$clean_up"; then
+                _del="$(delete_channels_file "$_id")" || \
+                    { printf 'Error deleting %s (ID: %s). Error code: %s\n' \
+                        "$_new_episode_name" "$_id" "$_del" >&2; continue; } 
+                _deleted_count="$((_deleted_count+1))"
+                _deleted_list="$(printf '%s\n' "$_channels_episode_file")"
+            fi
+            continue
+        fi
+
+        # OK, not with our naming scheme, let's do another search to see
+        # if there isn't a reliably good match
+
+        # Search for a pre-existing show, check for only one result
+        _plex_found_shows="$(search_plex_show "$_series_title")"
+        _plex_show_count="$("$jq_bin" -r \
+            '.MediaContainer.size' < "$_plex_found_shows")"
+        if [ "$_plex_show_count" -eq 1 ]; then # we found one, good
+            # Get show metadata
+            _plex_show_metadata_key="$("$jq_bin" -r \
+             '.MediaContainer.Metadata[].ratingKey' < "$_plex_found_shows")"
+            _plex_show_metadata="$(get_plex_json "metadata" \
+             "$_plex_show_metadata_key")" || \
+             { printf 'Error getting show metadata, code: %s' \
+                 "$_plex_show_metadata"; return 1; }
+
+            # Return the directory for a pre-existing show
+            _plex_show_dir="$("$jq_bin" -r \
+                '.MediaContainer.Metadata[].Location[].path' \
+                < "$_plex_show_metadata")"
+
+            # let's updated our new show path accordingly
+            _new_show_path="${_plex_show_dir}/Season ${_season_number}"
+            
+            # iterate over the files in the new directory, looking for a match
+            if [ -d "$_new_show_path" ]; then
+                for _match in "$_new_show_path"/*; do
+                    [ -e "$_match" ] || [ -L "$_match" ] || continue
+                    case "$_match" in
+                        *S"$_season_number"E"$_episode_number"*)
+                            # There's a match!
+                            _show_exists=true ;;
+                    esac
+                done
+            fi
+
+            if "$_show_exists" && "$clean_up"; then
+                _del="$(delete_channels_file "$_id")" || \
+                    { printf 'Error deleting %s. Error code: %s\n' \
+                        "$_channels_episode_file" "$_del" >&2; return 1; } 
+                _deleted_count="$((_deleted_count+1))"
+                _deleted_list="$(printf '\t%s\n' \
+                    "$_channels_episode_file")"
+            fi
+
+            if "$_show_exists"; then
+                _existing_count="$((_existing_count+1))"
+                continue
+            fi
+     fi
+
+     ### Process The File! ###
+     # The show doesn't appear to already exist in Plex
+     # Let's do what we came here to do!
+
+     # Create working paths
+     _tmp_transcode_dir="$working_dir/transcode"
+     _tmp_episode="$_tmp_transcode_dir/$_id.ts"
+     _tmp_edl="$_tmp_transcode_dir/$_id.edl"
+     _tmp_srt="$_tmp_transcode_dir/$_id.srt"
+     _tmp_encode="$_tmp_transcode_dir/$_id.mkv"
+
+     rm -rf "$_tmp_transcode_dir" || return 1
+     mkdir -p "$_new_show_path" "$_tmp_transcode_dir" || return 1
+
+     if "$transcode_file"; then
+         # Move file to a safe place for converting
+         cp -a "$_channels_episode_file" "$_tmp_episode" || return 1
+         cp -a "$_channels_edl_file" "$_tmp_edl" || return 1
+         cd "$_tmp_transcode_dir" || return 1
+     fi
+
+     # Re-encode the stream, cutting commercials
+     #if "$mark_commercials"; then
+     #    "$comchap" \
+     #        --ffmpeg="$ffmpeg_bin" \
+     #        --comskip="$comskip_bin" \
+     #        --comskip-ini="$comskip_ini" \
+     #        --lockfile="$_tmp_episode_dir/comchap.lock" \
+     #        "$_tmp_episode" || return 1
+     #fi
+
+     echo "cut commercials is: $cut_commercials"
+     $cut_commercials || echo "cut commercials is false"
+     echo "preserve subtitles is: $preserve_subtitles"
+     $preserve_subtitles || echo "preserve subtitles is false"
+
+     # Re-encode the stream marking with commercials
+     if "$cut_commercials"; then
+         "$comcut" \
+             --ffmpeg="$ffmpeg_bin" \
+             --lockfile="$tmp_dir/comcut.lock" \
+             "$(basename "$_tmp_episode")" || return 1
+     fi
+
+     # Transcode the stream with copied SRT
+     if "$preserve_subtitles"; then
+         "$ccextractor" \
+             "$_tmp_episode" \
+             -o "$_tmp_srt" || return 1
+
+        "$ffmpeg_bin" \
+            -nostdin \
+            -hide_banner \
+            -loglevel error \
+            -hwaccel nvdec \
+            -i "$_tmp_episode" \
+            -i "$_tmp_srt" \
+            -map 0 -map 1 \
+            -acodec copy \
+            -scodec copy \
+            -c:v h264_nvenc \
+            "$_tmp_encode" || return 1
+    else
+        "$ffmpeg_bin" \
+            -nostdin \
+            -hide_banner \
+            -loglevel error \
+            -hwaccel nvdec \
+            -i "$_tmp_episode" \
+            -acodec copy \
+            -c:v h264_nvenc \
+            "$_tmp_encode" || return 1
+     fi
+
+    if "$transcode_file"; then
+        # Copy transcoded file to Plex
+        _ext="mkv"
+        _new_show_file="${_new_show_path}/${_new_episode_name}.${_ext}"
+        cp -a "$_tmp_encode" \
+            "$_new_show_file" || return 1
+        _transcoded_count="$((_transcoded_count+1))"
+        _transcoded_list="$(printf '\t%s\n' "$_new_show_file")"
+    else
+        _ext="$(get_file_extension "$_channels_episode_file")"
+        _new_show_file="${_new_show_path}/${_new_episode_name}.${_ext}"
+        cp -a "$_channels_episode_file" "$_new_show_file" || return 1
+        _copied_count="$((_copied_count+1))"
+        _copied_list="$(printf '\t%s\n' "$_new_show_file")"
+    fi
+
+    # Delete from Channels DVR
+     if "$delete_processed"; then
+         _del="$(delete_channels_file "$_id")" || \
+             { printf 'Error deleting %s. Error code: %s\n' \
+                 "$_channels_episode_file" "$_del" >&2; return; } 
+        _deleted_count="$((_deleted_count+1))"
+        _deleted_list="$(printf '\t%s\n' "$_channels_episode_file")"
+     fi
+
+     # Return to home base
+     cd "$cwd" || return 1
+     # rm -rf "$_tmp_working_dir" # get rid of the evidence
+
+     # Rescan the TV/show library
+     _refresh="$(get_plex_json "refresh" "$plex_show_library_key")" || \
+         { printf 'Error refreshing library %s, code: %s\n' \
+             "$_id" "$_refresh"; return 1; }
+
+ done
+
+
+ if "$verbose"; then
+     [ -n "$_deleted_list" ] && \
+         printf '[%s] Deleted List:\n%s\n' \
+         "$(date -u)" "$_deleted_list" >&3
+
+     [ -n "$_copied_list" ] && \
+         printf '[%s] Copied List:\n%s\n' \
+         "$(date -u)" "$_copied_list" >&3
+    
+     [ -n "$_transcoded_list" ] && \
+          printf '[%s] Transcoded List:\n%s\n' \
+          "$(date -u)" "$_transcoded_list" >&3
+    
+     [ -n "$_excluded_list" ] && \
+         printf '[%s] Deleted List:\n%s\n' \
+         "$(date -u)" "$_deleted_list" >&3
+ fi
+
+ cat << EOF
+ $prgnam - Version $version
+ Transcoded $_transcoded_count files to Plex.
+ Copied $_copied_count original files to Plex.
+ Skipped $_excluded_count files from the exclusion file.
+ Skipped $_unfinished_count files that were still processing/airing.
+ Skipped $_already_deleted_count files that were already marked for delete.
+ Skipped $_existing_count files that already existed in Plex.
+ Processed $_processed_count total files in Channels DVR.
 EOF
-    # Return TV Section id's
-    printf "%s\n" "$_return_id"
 }
 
-get_plex_sections() {
-    if [ ! -x "$(command -v curl)" ]; then
-        log_this "Warning: curl not found."
-        return 1
-    fi
-    __return="$(curl -s http://"$PLEX_IP":"$PLEX_PORT"/library/sections/)"
-    case "$__return" in 
-        *401*) return 1 ;;
-    esac
-    printf "%s\n" "$__return"
-    return
-}
-
-refresh_plex() {
-    __library=$1
-    if [ ! -x "$(command -v curl)" ]; then
-        log_this "Warning: curl not found."
-        return 1
-    fi
-    __return_status="$(curl -s http://"$PLEX_IP":"$PLEX_PORT"/library/sections/"$__library"/refresh)"
-    case "$__return_status" in 
-        *401*) return 1 ;;
-    esac
-    return
-}
-
-
-# Clean-up lock and tmp files on exit
+# Run the function "clean_up" on INT ('ctrl-C')
 trap clean_up EXIT
 trap clean_up INT
 
-main() {
-    original_file="$1"
-    file_dir="$(dirname "$original_file")"
-    
-    # Check file_dir
-    # If it is '.' then we are likely operating within the existing directory
-    case "$file_dir" in
-        .) file_dir="$CWD" ;;
-    esac
-    
-    episode_file="$(basename "$original_file")"
-    episode="${episode_file%.*}"
-    episode_edl="$file_dir/$episode.edl"
-    episode_json="$file_dir/$episode.json"
-    series="$(basename "$file_dir")"
-    season="" # parsed later
-    
-    tmp_dir="$TMP/$PRGNAM/$series/$episode"
-    tmp_episode="$tmp_dir/$episode.ts"
-    tmp_edl="$tmp_dir/$episode.edl"
-    tmp_encode="$tmp_dir/$episode.mkv"
-    tmp_srt="$tmp_dir/$episode.en.srt"
-    
-    
-    # Get season from filename
-    set -f
-    old_ifs=$IFS
-    while IFS=' ' read -r word; do
-        case "$word" in
-            S[0-9][0-9]E*)
-                season="Season $(season_number "${word#S}")"
-                ;;
-        esac
-    done << EOF
-$(printf "%s\n" $episode)
-EOF
-    IFS=$old_ifs
-    set +f
-    
-    # Dependency check
-    for _bin in "$FFMPEG_BIN" "$COMCUT_BIN" "$CCEXTRACTOR_BIN"; do
-        if [ ! -x "$_bin" ]; then
-            log_this "Error: $_bin not found."
-            exit 1
-        fi
-    done
-    
-    # Check if season exists (skipping daily shows for now)
-    if [ -z "$season" ]; then
-        log_this "$episode is likely a news or sports broadcast, skipping."
-        return
-    fi
-    
-    # Check if edl exists
-    if [ ! -r "$episode_edl" ]; then
-        log_this "No edl file for $episode, skipping"
-        return
-    fi
-    
-    # Check if file already exists in Plex directory
-    if [ -r "$PLEX_TV_PATH/$series/$season/$episode.$PRGNAM.mkv" ]; then
-        log_this "$episode already copied to Plex."
-        return
-    fi
-    
-    # Check for lock file
-    while [ -f "$LOCK_FILE" ]; do
-        log_this "'$LOCK_FILE' exists, waiting to process '$series/$episode'."
-        sleep 10
-    done
-    
-    # Create lock file
-    log_this "Creating lock file for processing '$episode'"
-    touch "$LOCK_FILE"
-    
-    # Create tmp directory and copy original files there for processing
-    rm -rf "$tmp_dir"
-    
-    if ! mkdir -p "$tmp_dir"; then
-        log_this "Error: cannot create '$tmp_dir" 
-        exit 1
-    fi
-    
-    if ! cp -a "$original_file" "$tmp_episode"; then
-        log_this "Error: Cannot copy '$original_file' to '$tmp_episode'"
-        exit 1
-    elif ! cp -a "$episode_edl" "$tmp_edl"; then
-        log_this "Error: Cannot copy '$episode_edl' to '$tmp_edl'"
-        exit 1
-    fi
-    
-    # Move to working temp dir
-    if ! cd "$tmp_dir" >/dev/null 2>&1; then
-        log_this "Error: cannot find $tmp_dir"
-        exit 1
-    fi
-    
-    # Cut commercials
-    log_this "Cutting commercials from $tmp_episode"
-    
-    if ! $COMCUT_BIN --ffmpeg="$FFMPEG_BIN" \
-        --lockfile="$TMP/comcut.lock" \
-        "$(basename "$tmp_episode")"; then
-        log_this "Error cutting from $tmp_episode"
-        exit 1
-    fi
-    
-    # Get closed captions from to file
-    log_this "Pulling closed captions from $tmp_episode" 
-    if ! $CCEXTRACTOR_BIN \
-        "$tmp_episode" \
-        -o "$tmp_srt"; then
-        log_this "WARN: cannot extract closed captions from $tmp_episode."
-        exit 1
-    fi
-    
-    # Encode file to H.264 with mkv container using ffmpeg and mux in CC srt
-    log_this "Re-encoding '$tmp_episode' to MKV file while adding cc data"
-    if ! $FFMPEG_BIN \
-        -nostdin \
-        -hide_banner \
-        -loglevel error \
-        -hwaccel nvdec \
-        -i "$tmp_episode" \
-        -i "$tmp_srt" \
-        -map 0 -map 1 \
-        -acodec copy \
-        -scodec copy \
-        -c:v h264_nvenc \
-        "$tmp_encode"; then
-        log_this "Error: cannot convert '$tmp_episode'"
-        exit 1
-    fi
-
-    # Check that the file exported
-    if [ ! -f "$tmp_encode" ]; then
-        log_this "Error: '$tmp_encode' was not encoded by ffmpeg."
-        exit 1
-    fi
-    
-    # Copy Channels DVR file to Plex
-    if ! mkdir -p "$PLEX_TV_PATH/$series/$season"; then
-        log_this "Error: cannot create" \
-        "'$PLEX_TV_PATH/$series/$season' directory"
-        exit 1
-    fi
-
-    plex_output="$PLEX_TV_PATH/$series/$season/$episode.$PRGNAM.mkv"
-    
-    log_this "Copying '$tmp_encode'" \
-        "to '$PLEX_TV_PATH/$series/$season/$episode.$PRGNAM.mkv'"
-    if ! cp -a "$tmp_encode" "$plex_output"; then
-        log_this "Error: cannot coppy '$tmp_encode' to '$plex_output'"
-        exit 1
-    fi
-
-    log_this "Changing ownership of '$PLEX_TV_PATH/$series/$season' to" \
-        "'$PLEX_USER':'$PLEX_GROUP'"
-    if ! chown -R $PLEX_USER:$PLEX_GROUP "$PLEX_TV_PATH/$series/$season"; then
-        log_this "Warn: unable to change ownership of $PLEX_TV_PATH"
-    fi
-    
-    log_this "Success! '$original_file' converted and copied to Plex."
-
-
-    # Refresh Plex TV libraries, if possible
-    if [ -n "$PLEX_TV_SECTION_IDS" ]; then
-        for id in $PLEX_TV_SECTION_IDS; do
-            log_this "Refreshing Plex library '$id'"
-            if ! refresh_plex "$id"; then
-                log_this "Error refreshing Plex, library id '$id'"
-            fi
-        done
-    fi
-    
-    # TODO: inform Sonarr API that a manually imported file?
-    # TODO: have option to remove file from Channels DVR
-    clean_up
-    return
-}
-
-# Try to get TV Section IDs from Plex
-plex_sections=""
-if [ -n "$PLEX_IP" ] && [ -z "$PLEX_PLEX_TV_SECTION_IDS" ]; then
-    plex_sections="$(get_plex_sections)"
-    if [ "$plex_sections" ]; then
-        PLEX_TV_SECTION_IDS="$(parse_plex_tv_sections "$plex_sections")"
-    fi
-fi
-
-# Walk through the channels dvr path and look for files
-for dir in $CHANNELS_DVR_PATH/*; do
-    [ -d "$dir" ] || continue
-    for file in $dir/*; do
-        [ -f "$file" ] || continue
-        case "$file" in *.mpg)
-            main "$file" ;;
-        esac
-    done
-done
-
-exit
+# Run "main" function, remove the working directory if succesful
+# shellcheck disable=SC2068 #(globbing is the intention)
+main $@ 3>&1
